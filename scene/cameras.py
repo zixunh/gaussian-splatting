@@ -12,7 +12,7 @@
 import torch
 from torch import nn
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix, fov2focal
 from utils.general_utils import PILtoTorch
 import cv2
 
@@ -31,6 +31,10 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.fx = fov2focal(FoVx, resolution[0]) # for ray-splatting
+        self.fy = fov2focal(FoVy, resolution[1])
+        self.cx = resolution[0] / 2
+        self.cy = resolution[1] / 2
 
         try:
             self.data_device = torch.device(data_device)
@@ -87,6 +91,60 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+        sampled_rays, tan_theta, tan_phi = self.fov_sample2ray(FoVx/2, FoVy/2, 5e-3)
+        self.sampled_rays = sampled_rays
+        self.omni_tan_theta = self.omni_map_z(torch.tan(tan_theta), torch.cos(tan_theta) + 1e-7)
+        self.omni_tan_theta = self.omni_tan_theta.cuda()
+        self.omni_tan_phi = self.omni_map_z(torch.tan(tan_phi), torch.cos(tan_phi) + 1e-7)
+        self.omni_tan_phi = self.omni_tan_phi.cuda()
+        
+        # init_from_dataset() only
+        if self.original_image is not None:
+            self.sampled_image, _ = self.project_to_fisheye(
+                self.sampled_rays, 
+                self.original_image,  
+                self.fx, self.fy, self.cx, self.cy
+                )
+            self.sampled_image = self.sampled_image.reshape(-1, tan_phi.shape[0], tan_theta.shape[0])
+            #self.sampled_depth = self.sampled_depth.reshape(-1, tan_phi.shape[0], tan_theta.shape[0])
+
+    @staticmethod
+    def project_to_fisheye(sampled_rays, image, fx, fy, cx, cy, depth=None):
+        u = (sampled_rays[:, 0] / sampled_rays[:, 2]) * fx + cx
+        v = (sampled_rays[:, 1] / sampled_rays[:, 2]) * fy + cy
+        u, v = u.long(), v.long()
+        sampled_image = image[:, v, u]
+        sampled_depth = None
+        if depth is not None:
+            sampled_depth = depth[v, u]
+        
+        return sampled_image, sampled_depth
+
+    @staticmethod
+    def fov_sample2ray(fovx, fovy, interval):
+        theta_arr = torch.arange(interval / 2, fovx, interval).float()
+        theta_arr, _ = torch.sort(torch.cat((-theta_arr, theta_arr)))
+        phi_arr = torch.arange(interval / 2, fovy, interval).float()
+        phi_arr, _ = torch.sort(torch.cat((-phi_arr, phi_arr)))
+
+        sin_t = torch.sin(theta_arr)
+        cos_t = torch.cos(theta_arr)
+        sin_p = torch.sin(phi_arr).unsqueeze(1)
+        cos_p = torch.cos(phi_arr).unsqueeze(1)
+
+        r = ((sin_t**2)*(cos_p**2)+(cos_t**2)*(sin_p**2)+(cos_t**2)*(cos_p**2))**0.5
+        x = (sin_t * cos_p) / r
+        y = (cos_t * sin_p) / r
+        z = (cos_t * cos_p) / r
+        ray = torch.cat((x[...,None], y[...,None], z[...,None]), dim=-1).to('cuda').flatten(0,-2)
+
+        return ray, theta_arr, phi_arr
+
+    @staticmethod
+    def omni_map_z(m, z, xi=0.0): #1.1
+        return m / (1+xi*(z/(torch.abs(z)))*(1+m**2)**0.5)
+
         
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
